@@ -1,0 +1,218 @@
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+import os
+from dotenv import load_dotenv
+import aiohttp
+import json
+import logging
+from typing import Dict, Any
+import openai
+from datetime import datetime
+
+# Load environment variables
+load_dotenv()
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Initialize FastAPI app
+app = FastAPI()
+
+# Configure CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Initialize OpenAI client
+openai.api_key = os.getenv("OPENAI_API_KEY")
+
+# ServiceNow configuration
+SNOW_API_BASE = os.getenv('SNOW_INSTANCE')
+SNOW_USERNAME = os.getenv('SNOW_USERNAME')
+SNOW_PASSWORD = os.getenv('SNOW_PASSWORD')
+
+# Validate required environment variables
+if not all([SNOW_API_BASE, SNOW_USERNAME, SNOW_PASSWORD]):
+    raise ValueError("Missing required ServiceNow environment variables")
+
+# Add .service-now.com suffix if not present
+if not SNOW_API_BASE.endswith('.service-now.com'):
+    SNOW_API_BASE = f"{SNOW_API_BASE}.service-now.com"
+
+# Table mappings
+TABLE_MAPPINGS = {
+    "incident": "incident",
+    "change": "change_request",
+    "cmdb": "cmdb_ci",
+    "configuration item": "cmdb_ci",
+    "configuration": "cmdb_ci",
+    "ci": "cmdb_ci"
+}
+
+# Date format mapping
+DATE_FORMATS = {
+    "MM/DD/YYYY": "%m/%d/%Y",
+    "YYYY-MM-DD": "%Y-%m-%d"
+}
+
+def format_date(date_str: str) -> str:
+    """Format date string for ServiceNow API"""
+    try:
+        # Try different date formats
+        for format_str in DATE_FORMATS.values():
+            try:
+                date_obj = datetime.strptime(date_str, format_str)
+                return date_obj.strftime("%Y-%m-%d")
+            except ValueError:
+                continue
+        raise ValueError(f"Invalid date format: {date_str}")
+    except Exception as e:
+        logger.error(f"Error formatting date: {e}")
+        raise ValueError(f"Invalid date format: {date_str}")
+
+async def determine_table_and_query(natural_query: str) -> Dict[str, Any]:
+    try:
+        # Ask OpenAI to determine the table and query parameters
+        response = await openai.ChatCompletion.acreate(
+            model="gpt-4",
+            messages=[
+                {
+                    "role": "system",
+                    "content": """
+                    You are an expert in converting natural language queries into ServiceNow API queries.
+                    Always provide ONLY the query parameters and table name, with no explanation or additional text.
+                    Format your response as a JSON object with these fields:
+                    - table_name: The ServiceNow table to query (incident, change_request, or cmdb_ci)
+                    - query_parameters: The query parameters as a JSON object
+                    
+                    Example response:
+                    {
+                        "table_name": "incident",
+                        "query_parameters": {
+                            "sysparm_query": "active=true^priority<4",
+                            "sysparm_limit": "100"
+                        }
+                    }
+                    
+                    Use these field names and operators:
+                    - Use ^ for AND
+                    - Use OR for OR
+                    - Use >, <, >=, <= for comparisons
+                    - Use BETWEEN for date ranges
+                    - Use javascript:gs.dateGenerate() for dates
+                    - Use state=open for open records
+                    - Use active=true for active records
+                    
+                    Common states:
+                    - Incident: new, active, pending
+                    - Change: new, planned, scheduled, implemented
+                    - CMDB: active=true
+                    
+                    Date formats:
+                    - MM/DD/YYYY
+                    - YYYY-MM-DD
+                    """
+                },
+                {
+                    "role": "user",
+                    "content": f"Convert this natural language query into ServiceNow API query parameters: {natural_query}"
+                }
+            ],
+            temperature=0.1
+        )
+        
+        # Get the response content
+        content = response.choices[0].message.content.strip()
+        logger.info(f"OpenAI response content: {content}")
+        
+        # Parse the JSON response
+        try:
+            result = json.loads(content)
+            logger.info(f"Parsed result: {result}")
+            
+            # Validate the response structure
+            if not all(key in result for key in ["table_name", "query_parameters"]):
+                raise ValueError("Missing required fields in response")
+            
+            # Process any date parameters
+            query_params = result["query_parameters"]
+            if "sysparm_query" in query_params:
+                # Replace date strings with proper ServiceNow date format
+                query = query_params["sysparm_query"]
+                for format_str in DATE_FORMATS.values():
+                    try:
+                        date_obj = datetime.strptime(date_str, format_str)
+                        query = query.replace(date_str, date_obj.strftime("%Y-%m-%d"))
+                    except ValueError:
+                        continue
+                query_params["sysparm_query"] = query
+            
+            return result
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse JSON response: {e}")
+            logger.error(f"Response content: {content}")
+            raise HTTPException(status_code=400, detail="Invalid JSON response from OpenAI")
+    except Exception as e:
+        logger.error(f"Failed to determine table and query: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.get("/api/search_snow")
+async def search_snow(search_query: str, max_results: int = 100):
+    try:
+        logger.info(f"Received search request: {search_query}")
+        
+        # Determine the table and query parameters
+        result = await determine_table_and_query(search_query)
+        table_name = result["table_name"]
+        query_params = result["query_parameters"]
+        
+        # Add default filters if not present
+        if "sysparm_limit" not in query_params:
+            query_params["sysparm_limit"] = str(max_results)
+        
+        # Add default time range filter if not present
+        if "sysparm_query" not in query_params:
+            query_params["sysparm_query"] = "opened_atBETWEENjavascript:gs.dateGenerate('2025-07-06', '00:00:00')@javascript:gs.dateGenerate('2025-07-06', '23:59:59')"
+        
+        # Add default sort order for incidents and changes
+        if table_name == "incident" or table_name == "change_request":
+            query_params["sysparm_sortby_desc"] = "sys_created_on"
+        
+        # Construct the full API URL
+        SNOW_API_URL = f"https://{SNOW_API_BASE}/api/now/table/{table_name}"
+        
+        # Test authentication first
+        auth_url = f"https://{SNOW_API_BASE}/api/now/table/incident?sysparm_limit=1"
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                auth_url,
+                auth=aiohttp.BasicAuth(SNOW_USERNAME, SNOW_PASSWORD)
+            ) as auth_response:
+                if auth_response.status != 200:
+                    error_text = await auth_response.text()
+                    logger.error(f"ServiceNow authentication failed: {error_text}")
+                    raise HTTPException(status_code=401, detail="ServiceNow authentication failed. Please check your credentials.")
+        
+        # Make the actual query
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                SNOW_API_URL,
+                params=query_params,
+                auth=aiohttp.BasicAuth(SNOW_USERNAME, SNOW_PASSWORD)
+            ) as response:
+                if response.status != 200:
+                    error_text = await response.text()
+                    logger.error(f"ServiceNow API error: {error_text}")
+                    raise HTTPException(status_code=response.status, detail=error_text)
+
+                result = await response.json()
+
+                # Format the response
+                formatted_results = {
+                    "success": True,
+                {
