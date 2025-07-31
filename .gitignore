@@ -35,3 +35,4 @@ frontend/.env
 frontend/.env.local
 frontend/.env.*.local
 frontend/.env.*" > .gitignore
+backend/.env
